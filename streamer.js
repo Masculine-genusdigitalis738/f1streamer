@@ -24,6 +24,7 @@ const util                                = require('util');
 puppeteer.use(StealthPlugin());
 // AdblockerPlugin is intentionally absent — it intercepts and blocks M3U8 playlist requests.
 
+const treeKill                            = require('tree-kill');
 const { spawn, execSync }                 = require('child_process');
 const { PassThrough, Transform }          = require('stream');
 const net                                 = require('net');
@@ -33,6 +34,13 @@ const http                                = require('http');
 const config                              = require('./config.json');
 
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 15, keepAliveMsecs: 10000 });
+
+/*
+ * Exit code contract with f1scheduler.js:
+ *   exit(0)  — clean shutdown
+ *   exit(1)  — crash or transient stall, restart with same URL
+ *   exit(42) — embed URL confirmed dead (persistent 403/404), re-acquire from providers
+ */
 
 // ══════════════════════════════════════════════════════════════════
 //  BUILT-IN TLS PROXY
@@ -77,7 +85,7 @@ const AUDIO_TCP_PORT       = 19876;
 const AUDIO_BUFFER_SEGS    = 4;
 const VIDEO_BUFFER_SEGS    = 4;
 
-const PROBE_BYTES       = 50 * 1024 * 1024;
+const PROBE_BYTES       = 15 * 1024 * 1024;
 const PROBE_TIMEOUT_MS  = 90000;
 const DASHBOARD_INTERVAL = 2000;
 
@@ -298,8 +306,7 @@ function forceExit() {
     if (hlsProxyVideo)  hlsProxyVideo.stop();
     if (hlsProxyAudio)  hlsProxyAudio.stop();
     if (audioTcpServer) try { audioTcpServer.close(); } catch {}
-    if (currentPlayer)  try { currentPlayer.kill('SIGKILL'); } catch {}
-    try { execSync('pkill -9 -f "ffmpeg.*pipe:"', { stdio: 'ignore' }); } catch {}
+    if (currentPlayer?.pid) treeKill(currentPlayer.pid, 'SIGKILL');
     stopTlsProxy();
     try { streamer.stopStream(); }  catch {}
     try { streamer.leaveVoice(); }  catch {}
@@ -320,8 +327,6 @@ process.on('uncaughtException', (e) => {
         console.error(`\n ${A.bgRed}${A.bold} UNCAUGHT ERROR ${A.reset} ${e.message}\n${e.stack}`); 
     } 
 });
-
-try { execSync('pkill -9 -f ffmpeg', { stdio: 'ignore' }); } catch {}
 
 // ══════════════════════════════════════════════════════════════════
 //  HTTP
@@ -465,6 +470,8 @@ class HLSProxy {
         this.stats       = { segs: 0, skip: 0, bytes: 0, errs: 0, t0: Date.now() };
         this._timer      = null;
         this._pollMs     = 2000;
+        this._lastSegSuccess   = Date.now();
+        this._consecutiveErrMs = 0;
     }
 
     _segKey(url) {
@@ -476,7 +483,7 @@ class HLSProxy {
         if (this.seen.has(key)) return;
         this.seen.add(key);
         this._seenOrder.push(key);
-        if (this._seenOrder.length > 300) {
+        if (this._seenOrder.length > 15000) {
             const old = this._seenOrder.shift();
             this.seen.delete(old);
         }
@@ -571,16 +578,19 @@ class HLSProxy {
                         return null; 
                     }
                 }
-                return data; 
+                this._lastSegSuccess = Date.now();
+                this._consecutiveErrMs = 0;
+                return data;
             } catch (e) {
                 if (!this.running) return null;
                 if (attempt < 2) {
                     info('⚠️', `[${this.label}] Fetch failed (${e.message}). Fast-retrying ${attempt}/2...`);
-                    await new Promise(r => setTimeout(r, 1000)); 
+                    await new Promise(r => setTimeout(r, 1000));
                 } else {
+                    this._consecutiveErrMs = Date.now() - this._lastSegSuccess;
                     info('❌', `[${this.label}] Seg fetch failed permanently — ${e.message}`);
                     this.stats.skip++;
-                    return null; 
+                    return null;
                 }
             }
         }
@@ -625,7 +635,8 @@ function createProbeTee(src, targetBytes = PROBE_BYTES) {
                 (async () => {
                     try {
                         const p1 = new Promise((resolve) => {
-                            const proc = spawn('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', '-i', 'pipe:0']);
+                            const proc = spawn('ffprobe', ['-v', 'quiet', '-analyzeduration', '15000000', '-probesize', '15000000',
+                                '-print_format', 'json', '-show_format', '-show_streams', '-i', 'pipe:0']);
                             let raw = '';
                             proc.stdout.on('data', d => { raw += d; });
                             proc.on('close', (code) => resolve({ code, raw }));
@@ -635,10 +646,10 @@ function createProbeTee(src, targetBytes = PROBE_BYTES) {
 
                         const p2 = new Promise((resolve) => {
                             const proc = spawn('ffprobe', [
-                                '-v', 'quiet', 
-                                '-select_streams', 'v:0', 
-                                '-show_entries', 'frame=pkt_pts_time,pkt_dts_time,pict_type', 
-                                '-of', 'csv=p=0', 
+                                '-v', 'quiet', '-analyzeduration', '15000000', '-probesize', '15000000',
+                                '-select_streams', 'v:0',
+                                '-show_entries', 'frame=pkt_pts_time,pkt_dts_time,pict_type',
+                                '-of', 'csv=p=0',
                                 '-i', 'pipe:0'
                             ]);
                             let raw = '';
@@ -720,7 +731,10 @@ function createProbeTee(src, targetBytes = PROBE_BYTES) {
     });
 
     src.on('end', () => { if (!output.destroyed) output.end(); });
-    src.on('error', (e) => { if (!done) { done = true; _rej(e); } });
+    src.on('error', (e) => {
+        if (!done) { done = true; _rej(e); }
+        if (!output.destroyed) output.destroy();
+    });
     return { output, probePromise: promise };
 }
 
@@ -756,6 +770,15 @@ function startAudioTcpServer(audioStream, port) {
         const server = net.createServer((socket) => {
             info('🔌', `FFmpeg connected to dual-audio TCP socket on :${port}`);
             socket.on('error', () => {});
+
+            // ADD: timeout handling
+            socket.setTimeout(10000);
+            socket.on('timeout', () => {
+                info('⚠️', 'Audio TCP socket timed out — destroying');
+                socket.destroy();
+                server.close();
+            });
+
             audioStream.pipe(socket);
             audioStream.on('end', () => socket.destroy());
         });
@@ -819,6 +842,16 @@ async function getStreamInfo() {
                         setTimeout(() => newPage.close().catch(() => {}), 200);
                     }
                 } catch {}
+            }
+        });
+
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            const blocked = ['image', 'font', 'media'];
+            if (blocked.includes(req.resourceType())) {
+                req.abort();
+            } else {
+                req.continue();
             }
         });
 
@@ -1294,6 +1327,14 @@ async function runPipeline(streamData) {
             info('⚠️ ', `Engine stall detected (${Math.round((now - lastChange)/1000)}s dead silence). Forcing restart.`);
             if (currentPlayer) try { currentPlayer.kill('SIGKILL'); } catch {}
         }
+        // URL-dead detection: if segment fetcher has been failing for >30s, the URL is gone
+        if (hlsProxyVideo?._consecutiveErrMs > 30000) {
+            clearInterval(stallWatchdog);
+            info('💀', 'Segment fetcher failing for >30s — embed URL is dead, signalling re-acquire');
+            if (currentPlayer) try { treeKill(currentPlayer.pid, 'SIGKILL'); } catch {}
+            setTimeout(() => process.exit(42), 500);
+            return;
+        }
     }, 3000);
 
     player.on('close', (code, signal) => {
@@ -1332,8 +1373,14 @@ async function runPipeline(streamData) {
     // ── Cleanup ──
     clearInterval(stallWatchdog);
     stopDash();
-    if (hlsProxyVideo)  { try { hlsProxyVideo.stop(); }  catch {} hlsProxyVideo  = null; }
-    if (hlsProxyAudio)  { try { hlsProxyAudio.stop(); }  catch {} hlsProxyAudio  = null; }
+    if (hlsProxyVideo)  {
+        try { hlsProxyVideo.stop(); hlsProxyVideo.output.destroy(); } catch {}
+        hlsProxyVideo = null;
+    }
+    if (hlsProxyAudio)  {
+        try { hlsProxyAudio.stop(); hlsProxyAudio.output.destroy(); } catch {}
+        hlsProxyAudio = null;
+    }
     if (audioTcpServer) { try { audioTcpServer.close(); } catch {} audioTcpServer = null; }
     if (currentPlayer)  { try { currentPlayer.kill('SIGKILL'); } catch {} currentPlayer = null; }
     dash.totalOut = 0; dash.ffInBytes = 0;

@@ -21,7 +21,15 @@ const { spawn, execSync } = require('child_process');
 const https = require('https');
 const http  = require('http');
 
+const treeKill = require('tree-kill');
 const config = require('./config.json');
+
+/*
+ * streamer.js exit code contract:
+ *   0  — clean shutdown
+ *   1  — crash/stall, restart with same URL
+ *   42 — URL dead, run acquireStream() for a fresh embed URL
+ */
 
 // ══════════════════════════════════════════════════════════════════
 //  CONFIGURATION
@@ -143,8 +151,14 @@ function extractGPWords(gpName) {
     return gpName.toLowerCase().split(/\s+/).filter(w => w.length > 2);
 }
 
-function parseCalendar(filePath) {
+function parseCalendar(filePath, fallback = []) {
     const raw = fs.readFileSync(filePath, 'utf-8');
+
+    if (!raw.includes('END:VCALENDAR')) {
+        console.error(`${A.yellow}⚠️  Calendar file appears truncated — keeping previous version${A.reset}`);
+        return fallback;
+    }
+
     const unfolded = raw.replace(/\r?\n[ \t]/g, '');
     const lines = unfolded.split(/\r?\n/);
     const events = [];
@@ -155,6 +169,19 @@ function parseCalendar(filePath) {
             current = {};
         } else if (line === 'END:VEVENT' && current) {
             if (current.summary && current.summary.startsWith('F1') && current.dtstart) {
+                // Guard 1: dtstart must be a valid Date
+                if (!(current.dtstart instanceof Date) || isNaN(current.dtstart.getTime())) {
+                    console.error(`${A.yellow}⚠️  Malformed DTSTART — skipping: ${current.summary}${A.reset}`);
+                    current = null;
+                    continue;
+                }
+
+                // Guard 2: dtend must not precede dtstart
+                if (current.dtend instanceof Date && current.dtend <= current.dtstart) {
+                    console.error(`${A.yellow}⚠️  DTEND before DTSTART — using 2h default for: ${current.summary}${A.reset}`);
+                    current.dtend = new Date(current.dtstart.getTime() + 2 * 3600000);
+                }
+
                 const session = classifySession(current.summary);
                 if (session !== 'Unknown') {
                     events.push({
@@ -651,9 +678,17 @@ async function acquireStream(event) {
 
         // Both providers failed this round
         if (attempt < MAX_CASCADE_RETRIES) {
-            info('⏳', `All providers failed. Retrying in ${CASCADE_RETRY_MS / 60000} min... (${attempt}/${MAX_CASCADE_RETRIES})`);
-            await sleep(CASCADE_RETRY_MS);
+            const jitter = Math.floor(Math.random() * 30000) - 15000; // ±15 seconds
+            const retryWait = CASCADE_RETRY_MS + jitter;
+            info('⏳', `All providers failed. Retrying in ${Math.round(retryWait / 1000)}s... (${attempt}/${MAX_CASCADE_RETRIES})`);
+            await sleep(retryWait);
         }
+    }
+
+    // After all retries exhausted:
+    if (config.alwaysOnEmbed) {
+        info('🔌', 'All providers exhausted — falling back to alwaysOnEmbed');
+        return config.alwaysOnEmbed;
     }
 
     info('❌', `All ${MAX_CASCADE_RETRIES} cascade attempts exhausted. No stream found.`);
@@ -664,6 +699,7 @@ async function acquireStream(event) {
 //  CHILD PROCESS MANAGER
 // ══════════════════════════════════════════════════════════════════
 let childProc = null;
+let lastExitCode = null;
 let isShuttingDown = false;
 
 function spawnStreamer(embedUrl) {
@@ -677,7 +713,20 @@ function spawnStreamer(embedUrl) {
 
     childProc = child;
 
+    let hasProducedOutput = false;
+
+    const startupTimeout = setTimeout(() => {
+        if (!hasProducedOutput) {
+            info('⚠️', 'Streamer startup timeout — no output in 3 minutes, killing');
+            try { treeKill(child.pid, 'SIGKILL'); } catch {}
+        }
+    }, 3 * 60 * 1000);
+
     child.stdout.on('data', (d) => {
+        if (!hasProducedOutput) {
+            hasProducedOutput = true;
+            clearTimeout(startupTimeout);
+        }
         d.toString().split('\n').filter(l => l.trim()).forEach(l =>
             process.stdout.write(`  ${A.dim}[streamer]${A.reset} ${l}\n`)
         );
@@ -689,7 +738,9 @@ function spawnStreamer(embedUrl) {
     });
 
     child.on('exit', (code, signal) => {
+        clearTimeout(startupTimeout);
         info('🏁', `Streamer exited: code=${code} signal=${signal || '-'}`);
+        lastExitCode = code;
         childProc = null;
     });
 
@@ -705,12 +756,11 @@ function killStreamer() {
         try { childProc.kill('SIGTERM'); } catch {}
 
         setTimeout(() => {
-            if (childProc) {
-                try { childProc.kill('SIGKILL'); } catch {}
+            if (childProc?.pid) {
+                treeKill(childProc.pid, 'SIGKILL', (err) => {
+                    if (err) info('⚠️', `tree-kill error: ${err.message}`);
+                });
             }
-            // Kill orphaned ffmpeg/chromium processes spawned by streamer.js
-            try { execSync('pkill -9 -f ffmpeg', { stdio: 'ignore' }); } catch {}
-            try { execSync('pkill -9 -f "chromium.*--headless"', { stdio: 'ignore' }); } catch {}
             resolve();
         }, 5000);
     });
@@ -719,7 +769,7 @@ function killStreamer() {
 // ══════════════════════════════════════════════════════════════════
 //  SESSION HANDLER
 // ══════════════════════════════════════════════════════════════════
-async function handleSession(event) {
+async function handleSession(event, futureEvents) {
     divider();
     step('SESSION', `${A.bold}${event.summary}${A.reset}`);
     kv('Session',  event.session);
@@ -731,7 +781,7 @@ async function handleSession(event) {
     divider();
 
     // Acquire stream URL via provider cascade
-    const embedUrl = await acquireStream(event);
+    let embedUrl = await acquireStream(event);
 
     if (!embedUrl) {
         info('❌', `No stream found for ${event.summary}. Skipping session.`);
@@ -753,18 +803,49 @@ async function handleSession(event) {
     // Monitor until session ends or shutdown
     let restartCount = 0;
     const MAX_RESTARTS = 5;
+    lastExitCode = null;
+    let lastCrashTime = 0;
 
-    while (Date.now() < sessionEnd.getTime() && !isShuttingDown) {
+    const nextSessionImminent = () => {
+        const next = futureEvents.find(e => e !== event && e.end.getTime() > Date.now());
+        if (!next) return false;
+        return (next.start.getTime() - PRE_SESSION_MIN * 60000) <= Date.now();
+    };
+
+    while (Date.now() < sessionEnd.getTime() && !isShuttingDown && !nextSessionImminent()) {
         await sleep(10000);
 
         if (!childProc && Date.now() < sessionEnd.getTime() && !isShuttingDown) {
+            if (lastExitCode === 42) {
+                // URL is dead — re-acquire from providers
+                info('🔍', 'Embed URL died — re-running provider cascade for fresh URL...');
+                lastExitCode = null;
+                const freshUrl = await acquireStream(event);
+                if (freshUrl) {
+                    embedUrl = freshUrl;
+                    spawnStreamer(freshUrl);
+                } else {
+                    info('❌', 'Re-acquisition failed — no stream available');
+                    restartCount++;
+                }
+                continue;
+            }
+            // Reset counter if the streamer ran stably for more than 5 minutes before this crash
+            if (lastCrashTime > 0 && (Date.now() - lastCrashTime) > 5 * 60000) {
+                info('💚', `Streamer was stable for >5min — resetting crash counter (was ${restartCount})`);
+                restartCount = 0;
+            }
+            lastCrashTime = Date.now();
             restartCount++;
+
             if (restartCount > MAX_RESTARTS) {
                 info('❌', `Streamer crashed ${MAX_RESTARTS} times. Giving up on this session.`);
                 break;
             }
-            info('🔄', `Streamer died. Restarting (${restartCount}/${MAX_RESTARTS})...`);
-            await sleep(5000);
+
+            const backoffMs = Math.min(5000 * Math.pow(2, restartCount - 1), 60000);
+            info('🔄', `Streamer died. Restarting (${restartCount}/${MAX_RESTARTS}) in ${Math.round(backoffMs / 1000)}s...`);
+            await sleep(backoffMs);
             spawnStreamer(embedUrl);
         }
     }
@@ -809,7 +890,7 @@ function loadCalendar() {
     const stat = fs.statSync(calPath);
     if (stat.mtimeMs !== calendarMtime) {
         step('CALENDAR', `Parsing ${CALENDAR_FILE}...`);
-        allEvents = parseCalendar(calPath);
+        allEvents = parseCalendar(calPath, allEvents);
         calendarMtime = stat.mtimeMs;
         info('📅', `Loaded ${allEvents.length} F1 sessions`);
         return true;
@@ -852,7 +933,7 @@ async function main() {
         info('🔍', 'DRY RUN MODE — searching for stream but not launching');
         divider();
         if (futureEvents.length > 0) {
-            await handleSession(futureEvents[0]);
+            await handleSession(futureEvents[0], futureEvents);
         }
         info('✅', 'Dry run complete.');
         process.exit(0);
@@ -903,7 +984,7 @@ async function main() {
 
         // GO!
         info('🚀', `${A.green}${A.bold}GO TIME!${A.reset} Starting session: ${nextEvent.summary}`);
-        await handleSession(nextEvent);
+        await handleSession(nextEvent, futureEvents);
 
         // Remove completed event
         const idx = futureEvents.indexOf(nextEvent);

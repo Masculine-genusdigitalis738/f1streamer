@@ -180,6 +180,40 @@ journalctl -u f1streamer -f
 
 ---
 
+## Operational notes
+
+### Calendar sync
+
+The scheduler hot-reloads the calendar file between sessions, but only watches the path
+set in `calendarFile` at startup. Changing `calendarFile` in `config.json` requires a restart.
+
+If you're auto-syncing the calendar via cron, use atomic file replacement to prevent the
+scheduler from reading a partially-written file:
+
+    curl -s -o /tmp/f1cal.ics https://better-f1-calendar.vercel.app/api/calendar.ics \
+      && mv /tmp/f1cal.ics f1-better-calendar.ics
+
+Do not use a calendar app's webcal subscription to sync the file — calendar apps write
+non-atomically and can corrupt the file mid-read.
+
+### Config changes
+
+Changes to `config.json` require a process restart. Node caches `require('./config.json')`
+at startup — the running process will not see any edits until it is restarted. This includes
+`calendarFile` path changes.
+
+### Latency tuning
+
+`probeByteTarget` and `probeTimeoutMs` are paired tuning knobs that control stream startup
+latency. The default 15MB gives ~15 seconds of startup latency on a typical 6000kbps stream.
+
+- Reducing to 5MB cuts startup to ~5s but risks false-negative B-frame detection on
+  streams with sparse B-frames in low-motion scenes.
+- Increase `probeByteTarget` if your connection is slow and the probe is timing out before
+  collecting enough data — and increase `probeTimeoutMs` proportionally.
+
+---
+
 ## Under the hood
 
 Several parts of this codebase look like they're doing things the hard way. They are. Here is why each one exists.
